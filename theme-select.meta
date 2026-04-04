@@ -22,3 +22,6 @@ wrapper.1.type=command
 wrapper.2.keyword=theme-switch
 wrapper.2.script=theme-wrap.py
 wrapper.2.type=pre-exec
+wrapper.2.keyword=theme-switch
+wrapper.2.script=theme-wrap.py
+wrapper.2.type=pre-exec
