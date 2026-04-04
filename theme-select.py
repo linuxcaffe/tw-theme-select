@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+import os as _os_timing, time as _time_module
+if _os_timing.environ.get('TW_TIMING'):
+    import atexit as _atexit
+    _t0 = _time_module.perf_counter()
+
+    def _report_timing(_f=__file__):
+        elapsed = (_time_module.perf_counter() - _t0) * 1000
+        import os.path as _osp
+        print(f"[timing] {_osp.basename(_f)}: {elapsed:.1f}ms", file=__import__('sys').stderr)
+
+    _atexit.register(_report_timing)
+
+"""
+theme-select — ncurses TUI for previewing and selecting Taskwarrior color themes
+Part of the awesome-taskwarrior suite.
+
+Usage:
+  theme-select              # preview 'next' report
+  theme-select <report>     # preview named report (e.g. ready, minimal)
+  theme-select --dir PATH   # scan additional themes directory
+  theme-select --dev        # use ~/.taskrc-dev / ~/.task-dev
+"""
+
+import os
+import sys
+import re
+import curses
+import subprocess
+import tempfile
+import pty
+import select
+import fcntl
+import termios
+import struct
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+THEME_SEARCH_PATHS = [
+    Path.home() / '.task' / 'themes',
+    Path('/usr/share/taskwarrior'),
+    Path('/usr/local/share/taskwarrior'),
+]
+
+THEMES_RC = Path.home() / '.task' / 'config' / 'themes.rc'
+
+LEFT_W = 27   # theme-list panel width
+
+# Static curses color pair indices
+CP_HEADER   = 1
+CP_STATUS   = 2
+CP_SELECTED = 3
+CP_ACTIVE   = 4
+
+# ANSI-rendered color pairs are allocated dynamically from here
+_ANSI_BASE  = 10
+_ansi_pairs = {}      # (fg, bg) → pair_number
+_ansi_next  = [_ANSI_BASE]
+
+_ANSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
+_OSC_RE  = re.compile(r'\x1b\].*?(?:\x1b\\|\x07)', re.DOTALL)   # title bars etc.
+
+_preview_cache = {}   # (str(theme_path), report, width) → [lines]
+
+
+# ── Colors ─────────────────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(CP_HEADER,   curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_STATUS,   curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(CP_ACTIVE,   curses.COLOR_GREEN, -1)
+
+
+def _ansi_pair(fg, bg):
+    key = (fg, bg)
+    if key not in _ansi_pairs:
+        n = _ansi_next[0]
+        _ansi_next[0] += 1
+        try:
+            curses.init_pair(n, fg, bg)
+        except curses.error:
+            return 0
+        _ansi_pairs[key] = n
+    return _ansi_pairs[key]
+
+
+# ── ANSI → curses ──────────────────────────────────────────────────────────────
+
+def _parse_segments(text):
+    """Split ANSI-coded text into [(str, fg, bg, curses_attrs)] segments."""
+    fg, bg, attrs = -1, -1, 0
+    segments = []
+    pos = 0
+    A_ITALIC = getattr(curses, 'A_ITALIC', 0)
+
+    for m in _ANSI_RE.finditer(text):
+        s, e = m.span()
+        if s > pos:
+            segments.append((text[pos:s], fg, bg, attrs))
+        pos = e
+        raw = m.group(1)
+        codes = [int(x) for x in raw.split(';') if x] if raw else [0]
+        i = 0
+        while i < len(codes):
+            c = codes[i]
+            if   c == 0:                                            fg, bg, attrs = -1, -1, 0
+            elif c == 1:                                            attrs |= curses.A_BOLD
+            elif c == 2:                                            attrs |= curses.A_DIM
+            elif c == 3:                                            attrs |= A_ITALIC
+            elif c == 4:                                            attrs |= curses.A_UNDERLINE
+            elif c == 7:                                            attrs |= curses.A_REVERSE
+            elif 30 <= c <= 37:                                     fg = c - 30
+            elif c == 39:                                           fg = -1
+            elif 40 <= c <= 47:                                     bg = c - 40
+            elif c == 49:                                           bg = -1
+            elif 90 <= c <= 97:                                     fg = (c - 90) + 8
+            elif 100 <= c <= 107:                                   bg = (c - 100) + 8
+            elif c == 38 and i + 2 < len(codes) and codes[i+1] == 5:
+                fg = codes[i + 2]; i += 2
+            elif c == 48 and i + 2 < len(codes) and codes[i+1] == 5:
+                bg = codes[i + 2]; i += 2
+            i += 1
+
+    if pos < len(text):
+        segments.append((text[pos:], fg, bg, attrs))
+    return segments
+
+
+def addstr_ansi(win, y, x, text, max_w):
+    """Write ANSI-colored text to a curses window, clipped to max_w columns."""
+    col   = x
+    limit = x + max_w
+    for chunk, fg, bg, attrs in _parse_segments(text):
+        if col >= limit:
+            break
+        chunk = chunk[:limit - col]
+        if not chunk:
+            continue
+        pair = _ansi_pair(fg, bg)
+        try:
+            win.addstr(y, col, chunk, attrs | curses.color_pair(pair))
+        except curses.error:
+            pass
+        col += len(chunk)
+
+
+# ── Theme discovery ────────────────────────────────────────────────────────────
+
+def find_themes(extra_dir=None):
+    """Return sorted list of Path objects for all unique .theme files found."""
+    search = list(THEME_SEARCH_PATHS)
+    if extra_dir:
+        search.insert(0, Path(extra_dir).expanduser())
+    seen, result = set(), []
+    for d in search:
+        if not d.exists():
+            continue
+        for f in sorted(d.glob('*.theme')):
+            if f.stem.endswith('.old'):
+                continue
+            if f.name not in seen:
+                seen.add(f.name)
+                result.append(f)
+    return result
+
+
+def get_taskrc():
+    if 'TASKRC' in os.environ:
+        return Path(os.environ['TASKRC'])
+    return Path.home() / '.taskrc'
+
+
+def get_active_theme(themes_rc, taskrc=None):
+    """Return Path of the active (uncommented) theme include.
+
+    Reads themes.rc if it exists, otherwise falls back to taskrc (legacy).
+    """
+    for src in filter(None, [themes_rc, taskrc]):
+        try:
+            for line in src.read_text().splitlines():
+                m = re.match(r'^\s*include\s+(.+\.theme)\s*$', line)
+                if m:
+                    p = Path(m.group(1).strip()).expanduser()
+                    if p.exists():
+                        return p
+        except Exception:
+            pass
+    return None
+
+
+def ensure_themes_rc(themes_rc, taskrc, all_themes, active_theme):
+    """Create themes.rc if it doesn't exist, and wire it into taskrc once.
+
+    On first run:
+      1. Write themes.rc listing all discovered themes (active one uncommented).
+      2. In taskrc: comment out any bare theme includes, add `include themes.rc`.
+    Subsequent runs: themes.rc already exists, nothing to do.
+    """
+    if themes_rc.exists():
+        return
+
+    themes_rc.parent.mkdir(parents=True, exist_ok=True)
+    lines = ['# themes.rc — managed by theme-select\n',
+             '# Uncomment exactly one line to activate that theme.\n']
+    for path in all_themes:
+        is_active = bool(active_theme and path.resolve() == active_theme.resolve())
+        prefix = '' if is_active else '#'
+        lines.append(f'{prefix}include {path}\n')
+    themes_rc.write_text(''.join(lines))
+
+    # Patch taskrc: comment out bare theme includes, inject themes.rc include
+    try:
+        rc_lines = taskrc.read_text().splitlines(keepends=True)
+        new_rc = []
+        injected = False
+        for line in rc_lines:
+            if re.match(r'\s*#?\s*include\s+\S+\.theme', line):
+                stripped = line.rstrip('\n')
+                if not stripped.lstrip().startswith('#'):
+                    new_rc.append(f'#{stripped}\n')
+                else:
+                    new_rc.append(line)
+                if not injected:
+                    new_rc.append(f'include {themes_rc}\n')
+                    injected = True
+            else:
+                new_rc.append(line)
+        if not injected:
+            new_rc.append(f'include {themes_rc}\n')
+        taskrc.write_text(''.join(new_rc))
+    except Exception:
+        pass  # taskrc patch is best-effort; themes.rc still works if included manually
+
+
+# ── Preview via pseudo-tty ─────────────────────────────────────────────────────
+
+_THEME_LINE_RE = re.compile(
+    r'\s*#?\s*include\s+\S+\.theme'       # direct .theme include (active or commented)
+    r'|\s*include\s+\S+themes\.rc'        # themes.rc delegation line
+)
+
+def _make_preview_rc(taskrc, theme_path):
+    """Write a temp TASKRC with all theme/themes.rc includes replaced by theme_path."""
+    lines = taskrc.read_text().splitlines(keepends=True)
+    new_lines = []
+    injected = False
+    for line in lines:
+        if _THEME_LINE_RE.match(line):
+            if not injected:
+                new_lines.append(f'include {theme_path}\n')
+                injected = True
+            # suppress all other theme-related includes
+        else:
+            new_lines.append(line)
+    if not injected:
+        new_lines.append(f'include {theme_path}\n')
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.taskrc', delete=False)
+    tmp.write(''.join(new_lines))
+    tmp.close()
+    return tmp.name
+
+
+def _run_in_pty(cmd, env, cols, rows):
+    """Run cmd in a pseudo-tty sized (cols × rows), return decoded output."""
+    master_fd, slave_fd = pty.openpty()
+    winsize = struct.pack('HHHH', rows, cols, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+
+    proc = subprocess.Popen(
+        cmd, env=env,
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    buf = b''
+    while True:
+        try:
+            r, _, _ = select.select([master_fd], [], [], 0.2)
+            if r:
+                buf += os.read(master_fd, 4096)
+            elif proc.poll() is not None:
+                # Drain any remaining bytes
+                try:
+                    while True:
+                        r2, _, _ = select.select([master_fd], [], [], 0.05)
+                        if r2:
+                            buf += os.read(master_fd, 4096)
+                        else:
+                            break
+                except OSError:
+                    pass
+                break
+        except OSError:
+            break
+
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+    proc.wait()
+    return buf.decode('utf-8', errors='replace')
+
+
+def _clean_pty(text):
+    """Strip OSC sequences (title bars) and carriage returns left by pty."""
+    text = _OSC_RE.sub('', text)
+    return text.replace('\r\n', '\n').replace('\r', '')
+
+
+def get_preview(taskrc, theme_path, report, cols):
+    """Return list of output lines for the given theme/report (cached)."""
+    key = (str(theme_path), report, cols)
+    if key in _preview_cache:
+        return _preview_cache[key]
+
+    tmp_rc = _make_preview_rc(taskrc, theme_path)
+    try:
+        env = os.environ.copy()
+        env['TASKRC'] = tmp_rc
+        env['TERM']   = 'xterm-256color'
+        rows = 40
+        raw = _run_in_pty(
+            ['task', f'rc.defaultwidth={cols}', 'rc.color=on',
+             'rc.hooks=off', 'rc.verbose=label,blank', f'rc.limit=18', report],
+            env=env, cols=cols, rows=rows,
+        )
+        lines = _clean_pty(raw).splitlines()
+    except Exception as e:
+        lines = [f'Error: {e}']
+    finally:
+        try:
+            os.unlink(tmp_rc)
+        except Exception:
+            pass
+
+    _preview_cache[key] = lines
+    return lines
+
+
+# ── Apply theme (writes only to themes.rc) ────────────────────────────────────
+
+def apply_theme(themes_rc, theme_path, all_themes):
+    """Rewrite themes.rc with theme_path as the sole active include.
+
+    Non-include lines (comments, report.*.theme= config) are preserved in place.
+    The include block is rebuilt from all_themes at the position of the first
+    include line found; if no include lines exist yet, appended at the end.
+    """
+    try:
+        existing = themes_rc.read_text().splitlines(keepends=True)
+    except FileNotFoundError:
+        existing = []
+
+    # Collect non-include lines to preserve, track where include block starts
+    preamble = []
+    first_include_idx = None
+    for i, line in enumerate(existing):
+        if re.match(r'\s*#?\s*include\s+\S+\.theme', line):
+            if first_include_idx is None:
+                first_include_idx = i
+        else:
+            if first_include_idx is None:
+                preamble.append(line)
+            # lines after the include block (trailing comments etc.) are dropped
+            # to keep the file clean — only preamble is preserved
+
+    include_lines = []
+    for path in all_themes:
+        is_active = path.resolve() == theme_path.resolve()
+        prefix = '' if is_active else '#'
+        include_lines.append(f'{prefix}include {path}\n')
+
+    themes_rc.write_text(''.join(preamble + include_lines))
+
+
+# ── Drawing ────────────────────────────────────────────────────────────────────
+
+def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+
+    right_x = LEFT_W + 1
+    right_w  = max(1, w - right_x)
+    list_h   = h - 3
+
+    # ── Header ─────────────────────────────────────────────────────────────────
+    hdr_l = f"  theme-select v{VERSION}  [{report}]"
+    hdr_r = f"  {cursor + 1}/{len(themes)}  "
+    try:
+        stdscr.addstr(0, 0, hdr_l[:w - 1], curses.color_pair(CP_HEADER))
+        if len(hdr_r) < w:
+            stdscr.addstr(0, w - len(hdr_r), hdr_r, curses.color_pair(CP_HEADER))
+    except curses.error:
+        pass
+
+    # ── Left panel: theme list ─────────────────────────────────────────────────
+    for i, path in enumerate(themes):
+        if i < scroll or i >= scroll + list_h:
+            continue
+        row = 1 + (i - scroll)
+        selected = (i == cursor)
+        is_active = bool(active_theme and path.resolve() == active_theme.resolve())
+
+        arrow  = '►' if selected else ' '
+        marker = ' ●' if is_active else '  '
+        label  = f" {arrow} {path.stem}{marker}"[:LEFT_W].ljust(LEFT_W)
+
+        if selected:
+            attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD
+        elif is_active:
+            attr = curses.color_pair(CP_ACTIVE) | curses.A_BOLD
+        else:
+            attr = 0
+        try:
+            stdscr.addstr(row, 0, label, attr)
+        except curses.error:
+            pass
+
+    # ── Divider ────────────────────────────────────────────────────────────────
+    for row in range(1, h - 1):
+        try:
+            stdscr.addch(row, LEFT_W, curses.ACS_VLINE)
+        except curses.error:
+            pass
+
+    # ── Right panel: colored preview ───────────────────────────────────────────
+    for i, line in enumerate(preview_lines):
+        row = 1 + i
+        if row >= h - 1:
+            break
+        addstr_ansi(stdscr, row, right_x, line, right_w - 1)
+
+    # ── Status bar ─────────────────────────────────────────────────────────────
+    bar = message or (
+        "  ↑↓/jk navigate   Space/Enter apply   e edit theme   r refresh   q quit"
+    )
+    try:
+        stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
+    except curses.error:
+        pass
+
+    stdscr.refresh()
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def run(stdscr, themes, themes_rc, taskrc, report):
+    curses.curs_set(0)
+    init_colors()
+    stdscr.keypad(True)
+
+    if not themes:
+        stdscr.addstr(0, 0, "No .theme files found")
+        stdscr.getch()
+        return
+
+    active_theme = get_active_theme(themes_rc, taskrc)
+    cursor = next(
+        (i for i, p in enumerate(themes)
+         if active_theme and p.resolve() == active_theme.resolve()),
+        0,
+    )
+    scroll        = 0
+    message       = ''
+    preview_lines = []
+    last_theme    = None
+
+    while True:
+        h, w   = stdscr.getmaxyx()
+        list_h = h - 3
+        right_w = max(1, w - LEFT_W - 2)
+
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + list_h:
+            scroll = cursor - list_h + 1
+
+        theme_path = themes[cursor]
+        if theme_path != last_theme:
+            preview_lines = get_preview(taskrc, theme_path, report, right_w)
+            last_theme = theme_path
+
+        draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message)
+        message = ''
+
+        key = stdscr.getch()
+
+        if key in (ord('q'), ord('Q'), 27):
+            break
+
+        elif key in (curses.KEY_UP, ord('k')):
+            if cursor > 0:
+                cursor -= 1
+
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if cursor < len(themes) - 1:
+                cursor += 1
+
+        elif key == ord('g'):
+            cursor = 0
+
+        elif key == ord('G'):
+            cursor = len(themes) - 1
+
+        elif key in (ord(' '), 10, 13):
+            apply_theme(themes_rc, themes[cursor], themes)
+            active_theme = themes[cursor]
+            _preview_cache.clear()
+            message = f"Applied: {themes[cursor].stem}"
+
+        elif key == ord('e'):
+            editor = os.environ.get('VISUAL', os.environ.get('EDITOR', 'nano'))
+            curses.endwin()
+            subprocess.run([editor, str(themes[cursor])])
+            stdscr.refresh()
+            _preview_cache.clear()
+            active_theme = get_active_theme(themes_rc, taskrc)
+            last_theme = None
+            message = f"Returned from {os.path.basename(editor)}"
+
+        elif key == ord('r'):
+            _preview_cache.clear()
+            active_theme = get_active_theme(themes_rc, taskrc)
+            last_theme = None
+            message = "Refreshed"
+
+        elif key == curses.KEY_RESIZE:
+            _preview_cache.clear()
+            last_theme = None
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description=f"theme-select v{VERSION} — preview and select Taskwarrior color themes"
+    )
+    parser.add_argument('report', nargs='?', default='next',
+                        help='Taskwarrior report to preview (default: next)')
+    parser.add_argument('--dir', metavar='PATH',
+                        help='additional directory to scan for .theme files')
+    parser.add_argument('--dev', action='store_true',
+                        help='use ~/.taskrc-dev / ~/.task-dev (dev environment)')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    args = parser.parse_args()
+
+    if args.dev:
+        os.environ.setdefault('TASKRC',      str(Path.home() / '.taskrc-dev'))
+        os.environ.setdefault('TW_TASK_DIR', str(Path.home() / '.task-dev'))
+
+    taskrc = get_taskrc()
+    if not taskrc.exists():
+        print(f"TASKRC not found: {taskrc}", file=sys.stderr)
+        sys.exit(1)
+
+    themes = find_themes(args.dir)
+    if not themes:
+        print("No .theme files found", file=sys.stderr)
+        sys.exit(1)
+
+    themes_rc = THEMES_RC
+    active_theme = get_active_theme(themes_rc, taskrc)
+    ensure_themes_rc(themes_rc, taskrc, themes, active_theme)
+
+    try:
+        curses.wrapper(run, themes, themes_rc, taskrc, args.report)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()
