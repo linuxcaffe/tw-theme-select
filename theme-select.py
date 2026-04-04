@@ -403,6 +403,72 @@ def get_preview(taskrc, theme_path, report, cols):
     return lines
 
 
+# ── Per-report theme helpers ──────────────────────────────────────────────────
+
+def _resolve_theme_stem(stem):
+    """Resolve a theme stem (e.g. 'dark-256') to a Path, or None."""
+    for d in THEME_SEARCH_PATHS:
+        p = d / f'{stem}.theme'
+        if p.exists():
+            return p
+    return None
+
+
+def get_report_theme_path(themes_rc, report):
+    """Return Path of the theme configured for report, or None."""
+    try:
+        for line in themes_rc.read_text().splitlines():
+            m = re.match(rf'^\s*report\.{re.escape(report)}\.theme\s*=\s*(\S+)', line)
+            if m:
+                return _resolve_theme_stem(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def set_report_theme(themes_rc, report, theme_path):
+    """Write report.<report>.theme=<stem> into themes.rc preamble.
+
+    Updates an existing line (active or commented), or inserts after
+    the last report.*.theme= line, or before the first include line.
+    """
+    stem = theme_path.stem
+    new_line = f'report.{report}.theme={stem}\n'
+    key_re        = re.compile(rf'^\s*#?\s*report\.{re.escape(report)}\.theme\s*=', re.IGNORECASE)
+    any_report_re = re.compile(r'^\s*#?\s*report\.\w+\.theme\s*=')
+    include_re    = re.compile(r'^\s*#?\s*include\s+\S+\.theme')
+
+    try:
+        lines = themes_rc.read_text().splitlines(keepends=True)
+    except FileNotFoundError:
+        lines = []
+
+    # Replace existing line for this report (active or commented)
+    for i, line in enumerate(lines):
+        if key_re.match(line):
+            lines[i] = new_line
+            themes_rc.write_text(''.join(lines))
+            return
+
+    # Insert: after last report.*.theme= line, or before first include, or append
+    last_report_idx   = None
+    first_include_idx = None
+    for i, line in enumerate(lines):
+        if any_report_re.match(line):
+            last_report_idx = i
+        elif first_include_idx is None and include_re.match(line):
+            first_include_idx = i
+
+    if last_report_idx is not None:
+        lines.insert(last_report_idx + 1, new_line)
+    elif first_include_idx is not None:
+        lines.insert(first_include_idx, new_line)
+    else:
+        lines.append(new_line)
+
+    themes_rc.write_text(''.join(lines))
+
+
 # ── Apply theme (writes only to themes.rc) ────────────────────────────────────
 
 def apply_theme(themes_rc, theme_path, all_themes):
@@ -441,7 +507,8 @@ def apply_theme(themes_rc, theme_path, all_themes):
 
 # ── Drawing ────────────────────────────────────────────────────────────────────
 
-def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message):
+def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
+         configure_mode=False, for_report=None):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -450,7 +517,10 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
     list_h   = h - 3
 
     # ── Header ─────────────────────────────────────────────────────────────────
-    hdr_l = f"  theme-select v{VERSION}  [{report}]"
+    if configure_mode:
+        hdr_l = f"  theme-select v{VERSION}  [for: {for_report}]"
+    else:
+        hdr_l = f"  theme-select v{VERSION}  [{report}]"
     hdr_r = f"  {cursor + 1}/{len(themes)}  "
     try:
         stdscr.addstr(0, 0, hdr_l[:w - 1], curses.color_pair(CP_HEADER))
@@ -497,9 +567,14 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
         addstr_ansi(stdscr, row, right_x, line, right_w - 1)
 
     # ── Status bar ─────────────────────────────────────────────────────────────
-    bar = message or (
-        "  ↑↓/jk navigate   Space/Enter apply   e edit theme   r refresh   q quit"
-    )
+    if configure_mode:
+        bar = message or (
+            f"  ↑↓/jk navigate   Space/Enter set {for_report} theme   e edit   r refresh   q quit"
+        )
+    else:
+        bar = message or (
+            "  ↑↓/jk navigate   Space/Enter apply   e edit theme   r refresh   q quit"
+        )
     try:
         stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
     except curses.error:
@@ -510,7 +585,8 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
-def run(stdscr, themes, themes_rc, taskrc, report):
+def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
+    configure_mode = for_report is not None
     curses.curs_set(0)
     init_colors()
     stdscr.keypad(True)
@@ -520,7 +596,12 @@ def run(stdscr, themes, themes_rc, taskrc, report):
         stdscr.getch()
         return
 
-    active_theme = get_active_theme(themes_rc, taskrc)
+    def _get_active():
+        if configure_mode:
+            return get_report_theme_path(themes_rc, for_report)
+        return get_active_theme(themes_rc, taskrc)
+
+    active_theme = _get_active()
     cursor = next(
         (i for i, p in enumerate(themes)
          if active_theme and p.resolve() == active_theme.resolve()),
@@ -546,7 +627,8 @@ def run(stdscr, themes, themes_rc, taskrc, report):
             preview_lines = get_preview(taskrc, theme_path, report, right_w)
             last_theme = theme_path
 
-        draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message)
+        draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
+             configure_mode=configure_mode, for_report=for_report)
         message = ''
 
         key = stdscr.getch()
@@ -569,10 +651,16 @@ def run(stdscr, themes, themes_rc, taskrc, report):
             cursor = len(themes) - 1
 
         elif key in (ord(' '), 10, 13):
-            apply_theme(themes_rc, themes[cursor], themes)
-            active_theme = themes[cursor]
-            _preview_cache.clear()
-            message = f"Applied: {themes[cursor].stem}"
+            if configure_mode:
+                set_report_theme(themes_rc, for_report, themes[cursor])
+                active_theme = themes[cursor]
+                _preview_cache.clear()
+                message = f"Set {for_report} theme: {themes[cursor].stem}"
+            else:
+                apply_theme(themes_rc, themes[cursor], themes)
+                active_theme = themes[cursor]
+                _preview_cache.clear()
+                message = f"Applied: {themes[cursor].stem}"
 
         elif key == ord('e'):
             editor = os.environ.get('VISUAL', os.environ.get('EDITOR', 'nano'))
@@ -580,13 +668,13 @@ def run(stdscr, themes, themes_rc, taskrc, report):
             subprocess.run([editor, str(themes[cursor])])
             stdscr.refresh()
             _preview_cache.clear()
-            active_theme = get_active_theme(themes_rc, taskrc)
+            active_theme = _get_active()
             last_theme = None
             message = f"Returned from {os.path.basename(editor)}"
 
         elif key == ord('r'):
             _preview_cache.clear()
-            active_theme = get_active_theme(themes_rc, taskrc)
+            active_theme = _get_active()
             last_theme = None
             message = "Refreshed"
 
@@ -602,8 +690,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=f"theme-select v{VERSION} — preview and select Taskwarrior color themes"
     )
-    parser.add_argument('report', nargs='?', default='next',
-                        help='Taskwarrior report to preview (default: next)')
+    parser.add_argument('report', nargs='?', default=None,
+                        help='Report to preview; if given, also sets report.<name>.theme= on apply')
     parser.add_argument('--dir', metavar='PATH',
                         help='additional directory to scan for .theme files')
     parser.add_argument('--dev', action='store_true',
@@ -629,8 +717,11 @@ def main():
     active_theme = get_active_theme(themes_rc, taskrc)
     ensure_themes_rc(themes_rc, taskrc, themes, active_theme)
 
+    for_report    = args.report                     # None = normal mode
+    preview_report = args.report or 'next'           # always have a report to preview
+
     try:
-        curses.wrapper(run, themes, themes_rc, taskrc, args.report)
+        curses.wrapper(run, themes, themes_rc, taskrc, preview_report, for_report)
     except KeyboardInterrupt:
         pass
 
