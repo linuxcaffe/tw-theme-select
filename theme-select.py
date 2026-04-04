@@ -235,6 +235,22 @@ def get_taskrc():
     return Path.home() / '.taskrc'
 
 
+def get_valid_reports():
+    """Return set of recognized task report names."""
+    try:
+        result = subprocess.run(
+            ['task', '_show'], capture_output=True, text=True, timeout=5
+        )
+        reports = set()
+        for line in result.stdout.splitlines():
+            m = re.match(r'^report\.([^.]+)\.', line)
+            if m:
+                reports.add(m.group(1))
+        return reports
+    except Exception:
+        return set()
+
+
 def get_active_theme(themes_rc, taskrc=None):
     """Return Path of the active (uncommented) theme include.
 
@@ -717,8 +733,14 @@ def main():
     active_theme = get_active_theme(themes_rc, taskrc)
     ensure_themes_rc(themes_rc, taskrc, themes, active_theme)
 
-    for_report    = args.report                     # None = normal mode
+    for_report     = args.report                     # None = normal mode
     preview_report = args.report or 'next'           # always have a report to preview
+
+    if for_report is not None:
+        valid = get_valid_reports()
+        if valid and for_report not in valid:
+            print(f"theme-select: '{for_report}' is not a recognized report name", file=sys.stderr)
+            sys.exit(1)
 
     try:
         curses.wrapper(run, themes, themes_rc, taskrc, preview_report, for_report)
