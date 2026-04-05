@@ -96,7 +96,7 @@ import termios
 import struct
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 
 THEME_SEARCH_PATHS = [
     Path.home() / '.task' / 'themes',
@@ -123,6 +123,7 @@ _ANSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
 _OSC_RE  = re.compile(r'\x1b\].*?(?:\x1b\\|\x07)', re.DOTALL)   # title bars etc.
 
 _preview_cache = {}   # (str(theme_path), report, width) → [lines]
+
 
 
 # ── Colors ─────────────────────────────────────────────────────────────────────
@@ -267,6 +268,68 @@ def get_active_theme(themes_rc, taskrc=None):
         except Exception:
             pass
     return None
+
+
+_rule_prec_cache = {}   # str(theme_path) → str
+
+def get_rule_precedence(taskrc, theme_path):
+    """Return rule.precedence.color for the given theme via task _show (cached)."""
+    key = str(theme_path)
+    if key in _rule_prec_cache:
+        return _rule_prec_cache[key]
+    tmp_rc = _make_preview_rc(taskrc, theme_path)
+    try:
+        env = os.environ.copy()
+        env['TASKRC'] = tmp_rc
+        result = subprocess.run(
+            ['task', 'rc.hooks=off', '_show'],
+            capture_output=True, text=True, env=env, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            m = re.match(r'^rule\.precedence\.color=(.+)$', line)
+            if m:
+                val = m.group(1).strip()
+                _rule_prec_cache[key] = val
+                return val
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tmp_rc)
+        except Exception:
+            pass
+    _rule_prec_cache[key] = ''
+    return ''
+
+
+def get_color_legend(taskrc, theme_path, cols):
+    """Run 'task colors legend' via PTY with the theme loaded; return ANSI-coded lines (cached)."""
+    key = ('legend', str(theme_path), cols)
+    if key in _preview_cache:
+        return _preview_cache[key]
+    tmp_rc = _make_preview_rc(taskrc, theme_path)
+    try:
+        env = os.environ.copy()
+        env['TASKRC'] = tmp_rc
+        env['TERM']   = 'xterm-256color'
+        raw = _run_in_pty(
+            ['task', f'rc.defaultwidth={cols}', 'rc.color=on',
+             'rc.hooks=off', 'colors', 'legend'],
+            env=env, cols=cols, rows=80,
+        )
+        lines = _clean_pty(raw).splitlines()
+        # drop the TASKRC override warning lines task emits
+        lines = [l for l in lines if not re.match(r'^\x1b\[.*?TASKRC override', l)
+                                  and not re.match(r'^\x1b\[.*?Configuration override', l)]
+    except Exception as e:
+        lines = [f'Error: {e}']
+    finally:
+        try:
+            os.unlink(tmp_rc)
+        except Exception:
+            pass
+    _preview_cache[key] = lines
+    return lines
 
 
 def ensure_themes_rc(themes_rc, taskrc, all_themes, active_theme):
@@ -523,16 +586,227 @@ def apply_theme(themes_rc, theme_path, all_themes):
 
 # ── Drawing ────────────────────────────────────────────────────────────────────
 
+LEGEND_W = 52   # color legend panel width (3rd panel)
+
+
+# ── Color picker helpers ───────────────────────────────────────────────────────
+
+def _strip_ansi(text):
+    return re.sub(r'\x1b\[[0-9;]*[mK]', '', text)
+
+
+def _parse_legend_line(ansi_line):
+    """Extract (color_name, current_value) from a task colors legend line."""
+    text = _strip_ansi(ansi_line).strip()
+    m = re.match(r'^(color\.\S+)\s*(.*?)\s*$', text)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return None, None
+
+
+def _parse_color_value(value):
+    """Split 'bold white on red' → ('bold white', 'red'). Handles on-only and fg-only."""
+    m = re.match(r'^on\s+(.+)$', value.strip())
+    if m:
+        return '', m.group(1).strip()
+    parts = re.split(r'\s+on\s+', value.strip(), maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return value.strip(), ''
+
+
+def _rebuild_color_value(fg, bg):
+    fg, bg = fg.strip(), bg.strip()
+    if fg and bg:
+        return f"{fg} on {bg}"
+    return fg or (f"on {bg}" if bg else '')
+
+
+def edit_theme_color(theme_path, color_name, new_value):
+    """Rewrite color_name=new_value in the theme file. Returns (ok, message)."""
+    if not os.access(theme_path, os.W_OK):
+        return False, f"Read-only: {theme_path.name} — copy to ~/.task/themes/ to edit"
+    try:
+        lines = theme_path.read_text().splitlines(keepends=True)
+    except Exception as e:
+        return False, f"Cannot read: {e}"
+    pat = re.compile(rf'^\s*#?\s*{re.escape(color_name)}\s*=')
+    found = False
+    new_lines = []
+    for line in lines:
+        if pat.match(line) and not found:
+            new_lines.append(f"{color_name}={new_value}\n")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"{color_name}={new_value}\n")
+    try:
+        theme_path.write_text(''.join(new_lines))
+        return True, f"Updated: {color_name}={new_value}"
+    except Exception as e:
+        return False, f"Write failed: {e}"
+
+
+_swatch_cache = {}   # cols → lines
+
+def get_color_swatches(taskrc, theme_path, cols):
+    """Run 'task colors' (full swatch table) via PTY. Cached by width."""
+    if cols in _swatch_cache:
+        return _swatch_cache[cols]
+    tmp_rc = _make_preview_rc(taskrc, theme_path)
+    try:
+        env = os.environ.copy()
+        env['TASKRC'] = tmp_rc
+        env['TERM']   = 'xterm-256color'
+        raw = _run_in_pty(
+            ['task', f'rc.defaultwidth={cols}', 'rc.color=on', 'rc.hooks=off', 'colors'],
+            env=env, cols=cols, rows=80,
+        )
+        lines = _clean_pty(raw).splitlines()
+        lines = [l for l in lines
+                 if not re.match(r'^\x1b\[.*?(?:TASKRC override|Configuration override)', l)]
+    except Exception as e:
+        lines = [f'Error: {e}']
+    finally:
+        try:
+            os.unlink(tmp_rc)
+        except Exception:
+            pass
+    _swatch_cache[cols] = lines
+    return lines
+
+
+def color_picker_popup(stdscr, taskrc, theme_path, color_name, current_value):
+    """
+    Popup editor for a single theme color entry.
+    Shows 'task colors' swatch as scrollable reference.
+    Two input fields: fg / bg (Tab to switch).
+    Returns new value string, or None if cancelled.
+    """
+    h, w = stdscr.getmaxyx()
+    pop_h = min(h - 2, 38)
+    pop_w = min(w - 2, 84)
+    pop_y = max(0, (h - pop_h) // 2)
+    pop_x = max(0, (w - pop_w) // 2)
+    inner_w = pop_w - 2
+
+    # swatch area = popup minus: 2 borders + 1 title + 1 blank + 2 inputs + 1 preview + 1 hint
+    swatch_h = max(3, pop_h - 8)
+
+    swatch_lines = get_color_swatches(taskrc, theme_path, inner_w)
+    fg_input, bg_input = _parse_color_value(current_value)
+    swatch_scroll = 0
+    focus = 0   # 0=fg, 1=bg
+
+    win = curses.newwin(pop_h, pop_w, pop_y, pop_x)
+    win.keypad(True)
+
+    while True:
+        win.erase()
+        win.box()
+
+        # Title
+        title = f' {color_name} '
+        try:
+            win.addstr(0, max(1, (pop_w - len(title)) // 2), title,
+                       curses.A_BOLD | curses.color_pair(CP_HEADER))
+        except curses.error:
+            pass
+
+        # Swatch
+        for i in range(swatch_h):
+            src_i = i + swatch_scroll
+            if src_i >= len(swatch_lines):
+                break
+            addstr_ansi(win, 1 + i, 1, swatch_lines[src_i], inner_w)
+
+        base = 1 + swatch_h + 1   # row after blank separator
+
+        # fg field
+        fg_attr = curses.A_REVERSE if focus == 0 else 0
+        fg_disp = (fg_input + ' ').ljust(inner_w - 4)[:inner_w - 4]
+        try:
+            win.addstr(base,     1, 'fg: ')
+            win.addstr(base,     5, fg_disp, fg_attr)
+        except curses.error:
+            pass
+
+        # bg field
+        bg_attr = curses.A_REVERSE if focus == 1 else 0
+        bg_disp = (bg_input + ' ').ljust(inner_w - 4)[:inner_w - 4]
+        try:
+            win.addstr(base + 1, 1, 'bg: ')
+            win.addstr(base + 1, 5, bg_disp, bg_attr)
+        except curses.error:
+            pass
+
+        # Preview: render a sample in the described color
+        preview_val = _rebuild_color_value(fg_input, bg_input)
+        sample = f"  {preview_val or '(none)'}  "
+        try:
+            win.addstr(base + 2, 1, 'preview: ')
+            addstr_ansi(win, base + 2, 10, sample, inner_w - 10)
+        except curses.error:
+            pass
+
+        # Hint
+        hint = ' Tab fg/bg   ↑↓ scroll   Enter apply   Esc cancel'
+        try:
+            win.addstr(pop_h - 2, 1, hint[:inner_w], curses.color_pair(CP_STATUS))
+        except curses.error:
+            pass
+
+        win.refresh()
+        key = win.getch()
+
+        if key == 27:
+            return None
+        elif key in (10, 13):
+            return _rebuild_color_value(fg_input, bg_input)
+        elif key == ord('\t'):
+            focus = 1 - focus
+        elif key == curses.KEY_UP:
+            swatch_scroll = max(0, swatch_scroll - 1)
+        elif key == curses.KEY_DOWN:
+            swatch_scroll = min(max(0, len(swatch_lines) - swatch_h), swatch_scroll + 1)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if focus == 0:
+                fg_input = fg_input[:-1]
+            else:
+                bg_input = bg_input[:-1]
+        elif 32 <= key <= 126:
+            if focus == 0:
+                fg_input += chr(key)
+            else:
+                bg_input += chr(key)
+
+
 def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
-         configure_mode=False, for_report=None):
+         configure_mode=False, for_report=None,
+         show_legend=False, legend_lines=None, legend_scroll=0,
+         legend_focus=False, legend_cursor=0, rule_prec=''):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
-    right_x = LEFT_W + 1
-    right_w  = max(1, w - right_x)
-    list_h   = h - 3
+    HDR_ROWS = 2
+    list_h   = h - HDR_ROWS - 1   # rows available for content
 
-    # ── Header ─────────────────────────────────────────────────────────────────
+    # ── Layout: two or three panels ────────────────────────────────────────────
+    min_w_for_legend = LEFT_W + 2 + 20 + 2 + LEGEND_W
+    use_legend = show_legend and w >= min_w_for_legend
+
+    div1_x    = LEFT_W
+    right_x   = LEFT_W + 1
+    if use_legend:
+        legend_x  = w - LEGEND_W
+        div2_x    = legend_x - 1
+        preview_w = max(1, div2_x - right_x)
+    else:
+        legend_x  = None
+        preview_w = max(1, w - right_x)
+
+    # ── Header row 0 ───────────────────────────────────────────────────────────
     if configure_mode:
         hdr_l = f"  theme-select v{VERSION}  [for: {for_report}]"
     else:
@@ -545,11 +819,18 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
     except curses.error:
         pass
 
+    # ── Header row 1: rule.precedence.color ────────────────────────────────────
+    prec_str = f"  rule.precedence.color={rule_prec}" if rule_prec else "  rule.precedence.color=(loading...)"
+    try:
+        stdscr.addstr(1, 0, prec_str[:w - 1].ljust(w - 1), curses.color_pair(CP_HEADER))
+    except curses.error:
+        pass
+
     # ── Left panel: theme list ─────────────────────────────────────────────────
     for i, path in enumerate(themes):
         if i < scroll or i >= scroll + list_h:
             continue
-        row = 1 + (i - scroll)
+        row = HDR_ROWS + (i - scroll)
         selected = (i == cursor)
         is_active = bool(active_theme and path.resolve() == active_theme.resolve())
 
@@ -568,29 +849,53 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
         except curses.error:
             pass
 
-    # ── Divider ────────────────────────────────────────────────────────────────
-    for row in range(1, h - 1):
+    # ── Divider 1 (list | preview) ─────────────────────────────────────────────
+    for row in range(HDR_ROWS, h - 1):
         try:
-            stdscr.addch(row, LEFT_W, curses.ACS_VLINE)
+            stdscr.addch(row, div1_x, curses.ACS_VLINE)
         except curses.error:
             pass
 
-    # ── Right panel: colored preview ───────────────────────────────────────────
+    # ── Middle panel: colored report preview ───────────────────────────────────
     for i, line in enumerate(preview_lines):
-        row = 1 + i
+        row = HDR_ROWS + i
         if row >= h - 1:
             break
-        addstr_ansi(stdscr, row, right_x, line, right_w - 1)
+        addstr_ansi(stdscr, row, right_x, line, preview_w - 1)
+
+    # ── Divider 2 + legend panel ───────────────────────────────────────────────
+    if use_legend:
+        for row in range(HDR_ROWS, h - 1):
+            try:
+                stdscr.addch(row, div2_x, curses.ACS_VLINE)
+            except curses.error:
+                pass
+        lines = legend_lines or []
+        for i in range(list_h):
+            src_i = i + legend_scroll
+            if src_i >= len(lines):
+                break
+            row = HDR_ROWS + i
+            is_cur = legend_focus and (i == legend_cursor)
+            # indicator column — A_REVERSE makes it unambiguous on any terminal
+            ind_ch   = ord('>') if is_cur else ord(' ')
+            ind_attr = curses.A_REVERSE if is_cur else 0
+            try:
+                stdscr.addch(row, legend_x, ind_ch, ind_attr)
+            except curses.error:
+                pass
+            addstr_ansi(stdscr, row, legend_x + 1, lines[src_i], LEGEND_W - 2)
 
     # ── Status bar ─────────────────────────────────────────────────────────────
-    if configure_mode:
-        bar = message or (
-            f"  ↑↓/jk navigate   Space/Enter set {for_report} theme   e edit   r refresh   q quit"
-        )
+    if show_legend and use_legend:
+        legend_hint = "l hide  Tab unfocus  ↑↓ move  Enter edit-color" if legend_focus else "l hide  Tab focus-legend"
     else:
-        bar = message or (
-            "  ↑↓/jk navigate   Space/Enter apply   e edit theme   r refresh   q quit"
-        )
+        legend_hint = "l legend"
+    if configure_mode:
+        default_bar = f"  jk themes   Space set-{for_report}-theme   e edit   r refresh   {legend_hint}   q quit"
+    else:
+        default_bar = f"  jk themes   Space apply   e edit   r refresh   {legend_hint}   q quit"
+    bar = message or default_bar
     try:
         stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
     except curses.error:
@@ -627,11 +932,18 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
     message       = ''
     preview_lines = []
     last_theme    = None
+    show_legend   = False   # 'l' toggles the third panel
+    legend_focus  = False   # Tab shifts cursor to legend
+    legend_lines  = []
+    legend_scroll = 0
+    legend_cursor = 0       # position within visible legend rows
+    rule_prec     = ''
 
     while True:
-        h, w   = stdscr.getmaxyx()
-        list_h = h - 3
-        right_w = max(1, w - LEFT_W - 2)
+        h, w    = stdscr.getmaxyx()
+        list_h  = h - 3      # 2 header rows + 1 status bar
+        use_legend = show_legend and w >= LEFT_W + 2 + 20 + 2 + LEGEND_W
+        preview_w  = max(1, w - LEFT_W - 2 - (LEGEND_W + 1 if use_legend else 0))
 
         if cursor < scroll:
             scroll = cursor
@@ -640,11 +952,19 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
 
         theme_path = themes[cursor]
         if theme_path != last_theme:
-            preview_lines = get_preview(taskrc, theme_path, report, right_w)
+            preview_lines = get_preview(taskrc, theme_path, report, preview_w)
+            rule_prec     = get_rule_precedence(taskrc, theme_path)
+            if show_legend:
+                legend_lines  = get_color_legend(taskrc, theme_path, LEGEND_W)
+                legend_scroll = 0
+                legend_cursor = 0
             last_theme = theme_path
 
         draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
-             configure_mode=configure_mode, for_report=for_report)
+             configure_mode=configure_mode, for_report=for_report,
+             show_legend=show_legend, legend_lines=legend_lines,
+             legend_scroll=legend_scroll, legend_focus=legend_focus,
+             legend_cursor=legend_cursor, rule_prec=rule_prec)
         message = ''
 
         key = stdscr.getch()
@@ -652,19 +972,88 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
         if key in (ord('q'), ord('Q'), 27):
             break
 
-        elif key in (curses.KEY_UP, ord('k')):
+        elif key == ord('l'):
+            show_legend = not show_legend
+            if show_legend and not legend_lines:
+                legend_lines  = get_color_legend(taskrc, theme_path, LEGEND_W)
+                legend_scroll = 0
+                legend_cursor = 0
+            if not show_legend:
+                legend_focus = False
+
+        elif key == ord('\t'):
+            if show_legend:
+                legend_focus = not legend_focus
+                if legend_focus:
+                    legend_cursor = 0
+
+        # ↑↓: move legend cursor when focused, else navigate theme list
+        elif key == curses.KEY_UP:
+            if legend_focus and show_legend:
+                if legend_cursor > 0:
+                    legend_cursor -= 1
+                elif legend_scroll > 0:
+                    legend_scroll -= 1
+            elif cursor > 0:
+                cursor -= 1
+
+        elif key == curses.KEY_DOWN:
+            if legend_focus and show_legend:
+                total = len(legend_lines)
+                abs_pos = legend_scroll + legend_cursor
+                if abs_pos + 1 < total:
+                    if legend_cursor < list_h - 1:
+                        legend_cursor += 1
+                    else:
+                        legend_scroll += 1
+            elif cursor < len(themes) - 1:
+                cursor += 1
+
+        # j/k always navigate the theme list
+        elif key == ord('k'):
             if cursor > 0:
                 cursor -= 1
 
-        elif key in (curses.KEY_DOWN, ord('j')):
+        elif key == ord('j'):
             if cursor < len(themes) - 1:
                 cursor += 1
 
         elif key == ord('g'):
-            cursor = 0
+            if legend_focus:
+                legend_scroll = 0
+                legend_cursor = 0
+            else:
+                cursor = 0
 
         elif key == ord('G'):
-            cursor = len(themes) - 1
+            if legend_focus:
+                total = len(legend_lines)
+                legend_scroll = max(0, total - list_h)
+                legend_cursor = min(list_h - 1, total - 1 - legend_scroll)
+            else:
+                cursor = len(themes) - 1
+
+        elif key in (10, 13) and legend_focus and show_legend:
+            # Open color picker for the selected legend line
+            line_idx = legend_scroll + legend_cursor
+            if line_idx < len(legend_lines):
+                color_name, current_val = _parse_legend_line(legend_lines[line_idx])
+                if color_name:
+                    new_val = color_picker_popup(
+                        stdscr, taskrc, theme_path, color_name, current_val)
+                    stdscr.clear()   # force full repaint to clear popup artifacts
+                    if new_val is not None:
+                        ok, msg = edit_theme_color(theme_path, color_name, new_val)
+                        message = msg
+                        if ok:
+                            _preview_cache.clear()
+                            _rule_prec_cache.clear()
+                            _swatch_cache.clear()
+                            last_theme    = None
+                            legend_lines  = []
+                            legend_scroll = 0
+                            legend_cursor = 0
+                            continue   # jump to top → reload → draw → getch
 
         elif key in (ord(' '), 10, 13):
             if configure_mode:
@@ -679,7 +1068,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
                 message = f"Applied: {themes[cursor].stem}"
 
         elif key == ord('e'):
-            editor = os.environ.get('VISUAL', os.environ.get('EDITOR', 'nano'))
+            editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
             curses.endwin()
             subprocess.run([editor, str(themes[cursor])])
             stdscr.refresh()
@@ -690,8 +1079,10 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
 
         elif key == ord('r'):
             _preview_cache.clear()
+            _rule_prec_cache.clear()
             active_theme = _get_active()
             last_theme = None
+            legend_lines = []
             message = "Refreshed"
 
         elif key == curses.KEY_RESIZE:
