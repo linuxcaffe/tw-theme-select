@@ -106,13 +106,15 @@ THEME_SEARCH_PATHS = [
 
 THEMES_RC = Path.home() / '.task' / 'config' / 'themes.rc'
 
-LEFT_W = 27   # theme-list panel width
+LEFT_W   = 27   # theme-list panel width
+PREC_W   = 22   # precedence panel width (2-char prefix + up to 20-char name)
 
 # Static curses color pair indices
 CP_HEADER   = 1
 CP_STATUS   = 2
 CP_SELECTED = 3
 CP_ACTIVE   = 4
+CP_GRABBED  = 5   # precedence item grabbed for moving (black on yellow)
 
 # ANSI-rendered color pairs are allocated dynamically from here
 _ANSI_BASE  = 10
@@ -131,10 +133,11 @@ _preview_cache = {}   # (str(theme_path), report, width) → [lines]
 def init_colors():
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(CP_HEADER,   curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(CP_STATUS,   curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(CP_ACTIVE,   curses.COLOR_GREEN, -1)
+    curses.init_pair(CP_HEADER,   curses.COLOR_WHITE,  curses.COLOR_BLUE)
+    curses.init_pair(CP_STATUS,   curses.COLOR_BLACK,  curses.COLOR_GREEN)
+    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(CP_ACTIVE,   curses.COLOR_GREEN,  -1)
+    curses.init_pair(CP_GRABBED,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
 
 
 def _ansi_pair(fg, bg):
@@ -452,9 +455,13 @@ def _clean_pty(text):
     return text.replace('\r\n', '\n').replace('\r', '')
 
 
-def get_preview(taskrc, theme_path, report, cols):
-    """Return list of output lines for the given theme/report (cached)."""
-    key = (str(theme_path), report, cols)
+def get_preview(taskrc, theme_path, report, cols, prec_override=None):
+    """Return list of output lines for the given theme/report (cached).
+
+    prec_override: if set, passed as rc.rule.precedence.color= to the task
+    subprocess so the live reorder is reflected without writing to the file.
+    """
+    key = (str(theme_path), report, cols, prec_override or '')
     if key in _preview_cache:
         return _preview_cache[key]
 
@@ -464,11 +471,12 @@ def get_preview(taskrc, theme_path, report, cols):
         env['TASKRC'] = tmp_rc
         env['TERM']   = 'xterm-256color'
         rows = 40
-        raw = _run_in_pty(
-            ['task', f'rc.defaultwidth={cols}', 'rc.color=on',
-             'rc.hooks=off', 'rc.verbose=label,blank', f'rc.limit=18', report],
-            env=env, cols=cols, rows=rows,
-        )
+        cmd = ['task']
+        if prec_override:
+            cmd.append(f'rc.rule.precedence.color={prec_override}')
+        cmd += [f'rc.defaultwidth={cols}', 'rc.color=on',
+                'rc.hooks=off', 'rc.verbose=label,blank', f'rc.limit=18', report]
+        raw = _run_in_pty(cmd, env=env, cols=cols, rows=rows)
         lines = _clean_pty(raw).splitlines()
     except Exception as e:
         lines = [f'Error: {e}']
@@ -586,7 +594,7 @@ def apply_theme(themes_rc, theme_path, all_themes):
 
 # ── Drawing ────────────────────────────────────────────────────────────────────
 
-LEGEND_W = 52   # color legend panel width (3rd panel)
+LEGEND_W = 52   # color legend panel width
 
 
 # ── Color picker helpers ───────────────────────────────────────────────────────
@@ -782,29 +790,50 @@ def color_picker_popup(stdscr, taskrc, theme_path, color_name, current_value):
                 bg_input += chr(key)
 
 
+def _panel_layout(w, show_prec, show_legend):
+    """Return (use_prec, use_legend, right_x, preview_w, prec_x, legend_x) for width w."""
+    right_x   = LEFT_W + 1
+    min_core  = LEFT_W + 2 + 20   # list + divider + min preview
+
+    use_prec   = show_prec   and w >= min_core + 2 + PREC_W
+    min_w_leg  = min_core + (2 + PREC_W if use_prec else 0) + 2 + LEGEND_W
+    use_legend = show_legend and w >= min_w_leg
+
+    if use_prec and use_legend:
+        legend_x  = w - LEGEND_W
+        prec_x    = legend_x - 1 - PREC_W
+        preview_w = max(1, prec_x - 1 - right_x)
+    elif use_prec:
+        prec_x    = w - PREC_W
+        legend_x  = None
+        preview_w = max(1, prec_x - 1 - right_x)
+    elif use_legend:
+        legend_x  = w - LEGEND_W
+        prec_x    = None
+        preview_w = max(1, legend_x - 1 - right_x)
+    else:
+        prec_x = legend_x = None
+        preview_w = max(1, w - right_x)
+
+    return use_prec, use_legend, right_x, preview_w, prec_x, legend_x
+
+
 def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
          configure_mode=False, for_report=None,
          show_legend=False, legend_lines=None, legend_scroll=0,
-         legend_focus=False, legend_cursor=0, rule_prec=''):
+         legend_focus=False, legend_cursor=0, rule_prec='',
+         show_prec=False, prec_items=None, prec_cursor=0,
+         prec_focus=False, prec_grabbed=False, prec_scroll=0):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
     HDR_ROWS = 2
-    list_h   = h - HDR_ROWS - 1   # rows available for content
+    list_h   = h - HDR_ROWS - 1
 
-    # ── Layout: two or three panels ────────────────────────────────────────────
-    min_w_for_legend = LEFT_W + 2 + 20 + 2 + LEGEND_W
-    use_legend = show_legend and w >= min_w_for_legend
+    use_prec, use_legend, right_x, preview_w, prec_x, legend_x = \
+        _panel_layout(w, show_prec, show_legend)
 
-    div1_x    = LEFT_W
-    right_x   = LEFT_W + 1
-    if use_legend:
-        legend_x  = w - LEGEND_W
-        div2_x    = legend_x - 1
-        preview_w = max(1, div2_x - right_x)
-    else:
-        legend_x  = None
-        preview_w = max(1, w - right_x)
+    div1_x = LEFT_W
 
     # ── Header row 0 ───────────────────────────────────────────────────────────
     if configure_mode:
@@ -820,9 +849,10 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
         pass
 
     # ── Header row 1: rule.precedence.color ────────────────────────────────────
-    prec_str = f"  rule.precedence.color={rule_prec}" if rule_prec else "  rule.precedence.color=(loading...)"
+    prec_hdr = f"  rule.precedence.color={rule_prec}" if rule_prec else \
+               "  rule.precedence.color=(loading...)"
     try:
-        stdscr.addstr(1, 0, prec_str[:w - 1].ljust(w - 1), curses.color_pair(CP_HEADER))
+        stdscr.addstr(1, 0, prec_hdr[:w - 1].ljust(w - 1), curses.color_pair(CP_HEADER))
     except curses.error:
         pass
 
@@ -831,11 +861,11 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
         if i < scroll or i >= scroll + list_h:
             continue
         row = HDR_ROWS + (i - scroll)
-        selected = (i == cursor)
+        selected  = (i == cursor)
         is_active = bool(active_theme and path.resolve() == active_theme.resolve())
 
-        arrow  = '►' if selected else ' '
-        marker = ' ●' if is_active else '  '
+        arrow  = '>' if selected else ' '
+        marker = ' *' if is_active else '  '
         label  = f" {arrow} {path.stem}{marker}"[:LEFT_W].ljust(LEFT_W)
 
         if selected:
@@ -863,11 +893,43 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
             break
         addstr_ansi(stdscr, row, right_x, line, preview_w - 1)
 
-    # ── Divider 2 + legend panel ───────────────────────────────────────────────
-    if use_legend:
+    # ── Precedence panel ───────────────────────────────────────────────────────
+    if use_prec and prec_x is not None:
+        div_prec = prec_x - 1
         for row in range(HDR_ROWS, h - 1):
             try:
-                stdscr.addch(row, div2_x, curses.ACS_VLINE)
+                stdscr.addch(row, div_prec, curses.ACS_VLINE)
+            except curses.error:
+                pass
+        items = prec_items or []
+        for i in range(list_h):
+            src_i = i + prec_scroll
+            if src_i >= len(items):
+                break
+            row   = HDR_ROWS + i
+            is_sel     = prec_focus and (i == prec_cursor)
+            is_grab    = is_sel and prec_grabbed
+            if is_grab:
+                attr = curses.color_pair(CP_GRABBED) | curses.A_BOLD
+                pfx  = '* '
+            elif is_sel:
+                attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD
+                pfx  = '> '
+            else:
+                attr = 0
+                pfx  = '  '
+            label = (pfx + items[src_i])[:PREC_W].ljust(PREC_W)
+            try:
+                stdscr.addstr(row, prec_x, label, attr)
+            except curses.error:
+                pass
+
+    # ── Legend panel ───────────────────────────────────────────────────────────
+    if use_legend and legend_x is not None:
+        div_leg = legend_x - 1
+        for row in range(HDR_ROWS, h - 1):
+            try:
+                stdscr.addch(row, div_leg, curses.ACS_VLINE)
             except curses.error:
                 pass
         lines = legend_lines or []
@@ -876,8 +938,7 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
             if src_i >= len(lines):
                 break
             row = HDR_ROWS + i
-            is_cur = legend_focus and (i == legend_cursor)
-            # indicator column — match theme-list cursor style (black on cyan, bold)
+            is_cur   = legend_focus and (i == legend_cursor)
             ind_ch   = ord('>') if is_cur else ord(' ')
             ind_attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD if is_cur else 0
             try:
@@ -887,14 +948,24 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
             addstr_ansi(stdscr, row, legend_x + 1, lines[src_i], LEGEND_W - 2)
 
     # ── Status bar ─────────────────────────────────────────────────────────────
-    if show_legend and use_legend:
-        legend_hint = "l hide  Tab unfocus  ↑↓ move  Enter edit-color" if legend_focus else "l hide  Tab focus-legend"
+    if prec_focus and use_prec:
+        if prec_grabbed:
+            panel_hint = "p hide  ↑↓ move-item  Enter save  Esc cancel"
+        else:
+            panel_hint = "p hide  Tab next-panel  ↑↓ navigate  Enter grab"
+    elif legend_focus and use_legend:
+        panel_hint = "l hide  Tab next-panel  ↑↓ navigate  Enter edit-color"
+    elif use_prec or use_legend:
+        panel_hint = ("p focus" if use_prec else "") + \
+                     ("  " if use_prec and use_legend else "") + \
+                     ("l focus" if use_legend else "")
     else:
-        legend_hint = "l legend"
+        panel_hint = "p precedence  l legend"
+
     if configure_mode:
-        default_bar = f"  jk themes   Space set-{for_report}-theme   e edit   r refresh   {legend_hint}   q quit"
+        default_bar = f"  jk themes   Space set-{for_report}-theme   e edit   r refresh   {panel_hint}   q quit"
     else:
-        default_bar = f"  jk themes   Space apply   e edit   r refresh   {legend_hint}   q quit"
+        default_bar = f"  jk themes   Space apply   e edit   r refresh   {panel_hint}   q quit"
     bar = message or default_bar
     try:
         stdscr.addstr(h - 1, 0, bar[:w - 1].ljust(w - 1), curses.color_pair(CP_STATUS))
@@ -932,18 +1003,27 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
     message       = ''
     preview_lines = []
     last_theme    = None
-    show_legend   = False   # 'l' toggles the third panel
-    legend_focus  = False   # Tab shifts cursor to legend
+    last_prec_ovr = None    # tracks live-reorder override for preview cache
+    # legend panel
+    show_legend   = False
+    legend_focus  = False
     legend_lines  = []
     legend_scroll = 0
-    legend_cursor = 0       # position within visible legend rows
+    legend_cursor = 0
+    # precedence panel
+    show_prec     = False
+    prec_focus    = False
+    prec_items    = []      # working copy of rule.precedence.color tokens
+    prec_saved    = []      # saved copy for Esc-cancel
+    prec_cursor   = 0
+    prec_scroll   = 0
+    prec_grabbed  = False   # item at cursor is held for reordering
     rule_prec     = ''
 
     while True:
         h, w    = stdscr.getmaxyx()
         list_h  = h - 3      # 2 header rows + 1 status bar
-        use_legend = show_legend and w >= LEFT_W + 2 + 20 + 2 + LEGEND_W
-        preview_w  = max(1, w - LEFT_W - 2 - (LEGEND_W + 1 if use_legend else 0))
+        _, _, _, preview_w, _, _ = _panel_layout(w, show_prec, show_legend)
 
         if cursor < scroll:
             scroll = cursor
@@ -951,45 +1031,118 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             scroll = cursor - list_h + 1
 
         theme_path = themes[cursor]
+        prec_ovr   = ' '.join(prec_items) if prec_grabbed else None
+
         if theme_path != last_theme:
+            # theme changed — cancel any in-flight grab, reload everything
+            if prec_grabbed:
+                prec_items   = prec_saved[:]
+                prec_grabbed = False
+            rule_prec    = get_rule_precedence(taskrc, theme_path)
             preview_lines = get_preview(taskrc, theme_path, report, preview_w)
-            rule_prec     = get_rule_precedence(taskrc, theme_path)
             if show_legend:
                 legend_lines  = get_color_legend(taskrc, theme_path, LEGEND_W)
                 legend_scroll = 0
                 legend_cursor = 0
-            last_theme = theme_path
+            if show_prec:
+                prec_items  = rule_prec.split() if rule_prec else []
+                prec_cursor = 0
+                prec_scroll = 0
+            last_theme    = theme_path
+            last_prec_ovr = None
+        elif prec_ovr != last_prec_ovr:
+            # same theme, but live reorder changed — refresh preview only
+            preview_lines = get_preview(taskrc, theme_path, report, preview_w, prec_ovr)
+            last_prec_ovr = prec_ovr
 
         draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, message,
              configure_mode=configure_mode, for_report=for_report,
              show_legend=show_legend, legend_lines=legend_lines,
              legend_scroll=legend_scroll, legend_focus=legend_focus,
-             legend_cursor=legend_cursor, rule_prec=rule_prec)
+             legend_cursor=legend_cursor, rule_prec=rule_prec,
+             show_prec=show_prec, prec_items=prec_items,
+             prec_cursor=prec_cursor, prec_focus=prec_focus,
+             prec_grabbed=prec_grabbed, prec_scroll=prec_scroll)
         message = ''
 
         key = stdscr.getch()
 
-        if key in (ord('q'), ord('Q'), 27):
+        # ── Quit / cancel grab ─────────────────────────────────────────────────
+        if key == 27:   # Esc
+            if prec_grabbed:
+                prec_items   = prec_saved[:]
+                prec_grabbed = False
+                last_prec_ovr = None
+                _preview_cache.clear()
+                last_theme = None
+            else:
+                break
+        elif key in (ord('q'), ord('Q')):
             break
 
+        # ── Panel toggles (auto-focus on open) ────────────────────────────────
         elif key == ord('l'):
             show_legend = not show_legend
-            if show_legend and not legend_lines:
-                legend_lines  = get_color_legend(taskrc, theme_path, LEGEND_W)
-                legend_scroll = 0
-                legend_cursor = 0
-            if not show_legend:
+            if show_legend:
+                if not legend_lines:
+                    legend_lines  = get_color_legend(taskrc, theme_path, LEGEND_W)
+                    legend_scroll = 0
+                    legend_cursor = 0
+                legend_focus = True
+                prec_focus   = False
+            else:
                 legend_focus = False
 
+        elif key == ord('p'):
+            show_prec = not show_prec
+            if show_prec:
+                if not prec_items:
+                    prec_items  = rule_prec.split() if rule_prec else []
+                    prec_cursor = 0
+                    prec_scroll = 0
+                prec_focus   = True
+                legend_focus = False
+            else:
+                prec_focus   = False
+                prec_grabbed = False
+
+        # ── Tab: cycle focus between open panels ──────────────────────────────
         elif key == ord('\t'):
-            if show_legend:
-                legend_focus = not legend_focus
-                if legend_focus:
+            if prec_focus and show_prec:
+                prec_focus = False
+                if show_legend:
+                    legend_focus  = True
+                    legend_cursor = 0
+            elif legend_focus and show_legend:
+                legend_focus = False
+            else:
+                # focus first open panel
+                if show_prec:
+                    prec_focus   = True
+                    prec_cursor  = 0
+                elif show_legend:
+                    legend_focus  = True
                     legend_cursor = 0
 
-        # ↑↓: move legend cursor when focused, else navigate theme list
+        # ── Arrow keys: context-sensitive ─────────────────────────────────────
         elif key == curses.KEY_UP:
-            if legend_focus and show_legend:
+            if prec_focus and show_prec:
+                if prec_grabbed:
+                    abs_i = prec_scroll + prec_cursor
+                    if abs_i > 0:
+                        prec_items[abs_i], prec_items[abs_i - 1] = \
+                            prec_items[abs_i - 1], prec_items[abs_i]
+                        if prec_cursor > 0:
+                            prec_cursor -= 1
+                        else:
+                            prec_scroll -= 1
+                        last_prec_ovr = None   # trigger preview refresh
+                else:
+                    if prec_cursor > 0:
+                        prec_cursor -= 1
+                    elif prec_scroll > 0:
+                        prec_scroll -= 1
+            elif legend_focus and show_legend:
                 if legend_cursor > 0:
                     legend_cursor -= 1
                 elif legend_scroll > 0:
@@ -998,8 +1151,27 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
                 cursor -= 1
 
         elif key == curses.KEY_DOWN:
-            if legend_focus and show_legend:
-                total = len(legend_lines)
+            if prec_focus and show_prec:
+                if prec_grabbed:
+                    abs_i = prec_scroll + prec_cursor
+                    if abs_i + 1 < len(prec_items):
+                        prec_items[abs_i], prec_items[abs_i + 1] = \
+                            prec_items[abs_i + 1], prec_items[abs_i]
+                        if prec_cursor < list_h - 1:
+                            prec_cursor += 1
+                        else:
+                            prec_scroll += 1
+                        last_prec_ovr = None   # trigger preview refresh
+                else:
+                    total    = len(prec_items)
+                    abs_pos  = prec_scroll + prec_cursor
+                    if abs_pos + 1 < total:
+                        if prec_cursor < list_h - 1:
+                            prec_cursor += 1
+                        else:
+                            prec_scroll += 1
+            elif legend_focus and show_legend:
+                total   = len(legend_lines)
                 abs_pos = legend_scroll + legend_cursor
                 if abs_pos + 1 < total:
                     if legend_cursor < list_h - 1:
@@ -1009,7 +1181,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             elif cursor < len(themes) - 1:
                 cursor += 1
 
-        # j/k always navigate the theme list
+        # ── j/k always navigate the theme list ────────────────────────────────
         elif key == ord('k'):
             if cursor > 0:
                 cursor -= 1
@@ -1018,23 +1190,50 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             if cursor < len(themes) - 1:
                 cursor += 1
 
+        # ── g/G: jump to top/bottom of focused panel ──────────────────────────
         elif key == ord('g'):
-            if legend_focus:
+            if prec_focus:
+                prec_scroll = 0
+                prec_cursor = 0
+            elif legend_focus:
                 legend_scroll = 0
                 legend_cursor = 0
             else:
                 cursor = 0
 
         elif key == ord('G'):
-            if legend_focus:
-                total = len(legend_lines)
+            if prec_focus:
+                total       = len(prec_items)
+                prec_scroll = max(0, total - list_h)
+                prec_cursor = min(list_h - 1, total - 1 - prec_scroll)
+            elif legend_focus:
+                total         = len(legend_lines)
                 legend_scroll = max(0, total - list_h)
                 legend_cursor = min(list_h - 1, total - 1 - legend_scroll)
             else:
                 cursor = len(themes) - 1
 
+        # ── Enter: grab/save (prec) or open picker (legend) ───────────────────
+        elif key in (10, 13) and prec_focus and show_prec:
+            if prec_grabbed:
+                # save new order to theme file
+                new_prec = ' '.join(prec_items)
+                ok, msg  = edit_theme_color(theme_path, 'rule.precedence.color', new_prec)
+                message  = msg
+                prec_grabbed  = False
+                prec_saved    = []
+                if ok:
+                    _preview_cache.clear()
+                    _rule_prec_cache.clear()
+                    last_theme    = None
+                    last_prec_ovr = None
+            else:
+                # grab the item at cursor
+                if prec_items:
+                    prec_saved   = prec_items[:]
+                    prec_grabbed = True
+
         elif key in (10, 13) and legend_focus and show_legend:
-            # Open color picker for the selected legend line
             line_idx = legend_scroll + legend_cursor
             if line_idx < len(legend_lines):
                 color_name, current_val = _parse_legend_line(legend_lines[line_idx])
@@ -1050,10 +1249,12 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
                             _rule_prec_cache.clear()
                             _swatch_cache.clear()
                             last_theme    = None
+                            last_prec_ovr = None
                             legend_lines  = []
                             legend_scroll = 0
                             legend_cursor = 0
-                            continue   # jump to top → reload → draw → getch
+                            prec_items    = []   # reload prec list too
+                            continue
 
         elif key in (ord(' '), 10, 13):
             if configure_mode:
@@ -1073,21 +1274,28 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             subprocess.run([editor, str(themes[cursor])])
             stdscr.refresh()
             _preview_cache.clear()
-            active_theme = _get_active()
-            last_theme = None
+            active_theme  = _get_active()
+            last_theme    = None
+            last_prec_ovr = None
+            prec_items    = []
+            prec_grabbed  = False
             message = f"Returned from {os.path.basename(editor)}"
 
         elif key == ord('r'):
             _preview_cache.clear()
             _rule_prec_cache.clear()
-            active_theme = _get_active()
-            last_theme = None
-            legend_lines = []
+            active_theme  = _get_active()
+            last_theme    = None
+            last_prec_ovr = None
+            legend_lines  = []
+            prec_items    = []
+            prec_grabbed  = False
             message = "Refreshed"
 
         elif key == curses.KEY_RESIZE:
             _preview_cache.clear()
-            last_theme = None
+            last_theme    = None
+            last_prec_ovr = None
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
