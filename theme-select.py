@@ -1031,7 +1031,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             scroll = cursor - list_h + 1
 
         theme_path = themes[cursor]
-        prec_ovr   = ' '.join(prec_items) if prec_grabbed else None
+        prec_ovr   = ','.join(prec_items) if prec_grabbed else None
 
         if theme_path != last_theme:
             # theme changed — cancel any in-flight grab, reload everything
@@ -1045,7 +1045,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
                 legend_scroll = 0
                 legend_cursor = 0
             if show_prec:
-                prec_items  = rule_prec.split() if rule_prec else []
+                prec_items  = [x.strip() for x in rule_prec.split(',') if x.strip()]
                 prec_cursor = 0
                 prec_scroll = 0
             last_theme    = theme_path
@@ -1097,7 +1097,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             show_prec = not show_prec
             if show_prec:
                 if not prec_items:
-                    prec_items  = rule_prec.split() if rule_prec else []
+                    prec_items  = [x.strip() for x in rule_prec.split(',') if x.strip()]
                     prec_cursor = 0
                     prec_scroll = 0
                 prec_focus   = True
@@ -1217,7 +1217,7 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
         elif key in (10, 13) and prec_focus and show_prec:
             if prec_grabbed:
                 # save new order to theme file
-                new_prec = ' '.join(prec_items)
+                new_prec = ','.join(prec_items)
                 ok, msg  = edit_theme_color(theme_path, 'rule.precedence.color', new_prec)
                 message  = msg
                 prec_grabbed  = False
