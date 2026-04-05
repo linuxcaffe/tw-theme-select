@@ -877,9 +877,9 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
                 break
             row = HDR_ROWS + i
             is_cur = legend_focus and (i == legend_cursor)
-            # indicator column — A_REVERSE makes it unambiguous on any terminal
+            # indicator column — match theme-list cursor style (black on cyan, bold)
             ind_ch   = ord('>') if is_cur else ord(' ')
-            ind_attr = curses.A_REVERSE if is_cur else 0
+            ind_attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD if is_cur else 0
             try:
                 stdscr.addch(row, legend_x, ind_ch, ind_attr)
             except curses.error:

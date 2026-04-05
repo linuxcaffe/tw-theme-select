@@ -3,17 +3,21 @@
 
 # theme-select
 
-Two things in one: a live-preview theme browser for Taskwarrior, and an automatic
-per-report theme switcher that requires no manual intervention once configured.
+Three things in one: a live-preview theme browser, an interactive color editor,
+and an automatic per-report theme switcher that requires no manual intervention
+once configured.
 
 ## TL;DR
 
-- Full-screen two-panel TUI: theme list on the left, live colored report preview on the right
+- Full-screen three-panel TUI: theme list | live report preview | color legend
 - Navigate the list — preview updates instantly as you move
+- `l` opens the color legend panel; `Tab` focuses it; `Enter` opens the color picker
+- Edit any theme color interactively with a scrollable swatch reference
 - `Space` or `Enter` applies the selected theme (writes to `themes.rc`, never touches `.taskrc`)
 - `e` opens the selected theme file in `$EDITOR`
 - Per-report themes: configure `report.list.theme=dark-green-256` in `themes.rc` and
   `tw list` automatically runs in green, then restores your default theme afterward
+- `tw theme list` opens the TUI pre-set to configure the `list` report's theme
 - Requires Taskwarrior 2.6.0+, Python 3.6+
 
 ## Why this exists
@@ -22,8 +26,12 @@ Taskwarrior ships with 14+ color themes. Switching between them means editing `.
 commenting one `include` line out and uncommenting another. Comparing themes means editing,
 running a report, editing again. `theme-select` collapses that to a single keypress.
 
-The per-report switching goes further: different reports serve different purposes. A
-`ready` report for focused work, a `list` report for overview, a `minimal` report for
+The color editor goes further: select any color attribute from the live legend, edit
+the fg/bg values with a scrollable 256-color swatch as reference, and see the change
+reflected immediately — no manual file editing required.
+
+The per-report switching goes further still: different reports serve different purposes.
+A `ready` report for focused work, a `list` report for overview, a `minimal` report for
 sharing. Each can have its own palette, applied automatically and restored cleanly.
 
 ## Installation
@@ -60,6 +68,7 @@ Then register the per-report switcher manually (see [Per-report themes](#per-rep
 
 ```bash
 theme-select             # browse themes, preview against 'next' report
+theme-select list        # preview against 'list', apply sets report.list.theme=
 theme-select ready       # preview against your 'ready' report (or any report name)
 theme-select --dir PATH  # include an extra themes directory
 ```
@@ -68,21 +77,49 @@ theme-select --dir PATH  # include an extra themes directory
 
 | Key | Action |
 |-----|--------|
-| `↑` `↓` or `j` `k` | Navigate theme list |
+| `↑` `↓` | Navigate theme list (or legend when focused) |
+| `j` `k` | Navigate theme list (always) |
 | `Space` or `Enter` | Apply selected theme |
+| `l` | Toggle color legend panel |
+| `Tab` | Focus / unfocus the legend panel |
+| `Enter` (legend focused) | Open color picker for selected attribute |
+| `g` / `G` | Jump to top / bottom of theme list or legend |
 | `e` | Open selected theme file in `$EDITOR` |
-| `r` | Refresh (re-reads themes.rc and rescans directories) |
-| `g` / `G` | Jump to top / bottom |
+| `r` | Refresh (clears cache, re-reads themes.rc, rescans) |
 | `q` or `Esc` | Quit |
 
 **Display**
 
-Left panel lists all discovered themes. The active theme is marked `●`. The right
-panel shows a live preview of the selected theme applied to the report, rendered in
-full color via a pseudo-terminal (task thinks it's talking to a real terminal, so
-colors appear exactly as they would in normal use).
+```
+[ theme list  ] | [ report preview (live, full color) ] | [ color legend ]
+```
 
-The header shows the current report name and cursor position.
+The left panel lists all discovered themes; the active theme is marked `●`.
+The middle panel shows a live preview of the selected theme rendered in full color
+via a pseudo-terminal (task thinks it's talking to a real terminal, so colors appear
+exactly as they would in normal use).
+The right panel (toggle with `l`) shows `task colors legend` — every color attribute
+in the theme, rendered in its own color, with its name. Navigate the legend with
+arrow keys, press `Enter` to edit that attribute.
+
+The header shows the current report and `rule.precedence.color` for the selected theme.
+The legend panel requires a terminal at least ~103 columns wide.
+
+## Color editor
+
+Press `l` to open the legend panel, `Tab` to move focus to it, then navigate with
+`↑`/`↓` to the attribute you want to change. Press `Enter` to open the picker:
+
+- The picker shows a scrollable 256-color swatch (from `task colors`)
+- Two input fields: `fg` and `bg` — `Tab` switches between them
+- Type a color value (e.g. `bold white`, `color203`, `bright blue`)
+- `↑`/`↓` scroll the swatch for reference
+- `Enter` writes the value directly to the theme file
+- `Esc` cancels
+
+The edit is written immediately to the theme file. The preview and legend refresh
+automatically to show the result. Only themes in writable locations (e.g.
+`~/.task/themes/`) can be edited; system themes are read-only.
 
 ## themes.rc
 
@@ -130,25 +167,30 @@ tw next    →  no override configured               →  task next  (default th
 
 The restore always happens — even if task exits with an error.
 
-### How the "theme" keyword works
+### Configuring per-report themes interactively
 
-After `tw -I theme-select`, you'll see this line in `~/.task/config/.tw_wrappers`:
+```bash
+tw theme list    # opens TUI in configure mode for 'list'
+tw theme ready   # opens TUI in configure mode for 'ready'
+```
+
+In configure mode, `Space`/`Enter` sets `report.<name>.theme=` in `themes.rc` rather
+than changing the global active theme.
+
+### How the "theme-switch" wrapper works
+
+After `tw -I theme-select`, `~/.task/config/.tw_wrappers` contains two entries:
 
 ```
-theme|theme-wrap.py|Per-report theme switching|pre-exec
+theme|theme-select.py|...|command
+theme-switch|theme-wrap.py|...|pre-exec
 ```
 
-The keyword `theme` here is a **registration label**, not a command trigger. Unlike
-`command`-type wrappers (where typing `tw 42 ann` triggers the `ann` wrapper), a
-`pre-exec` wrapper runs automatically before every `tw` invocation — no keyword
-needed in your command.
+`theme-switch` is a `pre-exec` wrapper — it runs automatically before every `tw`
+invocation, no keyword needed. `tw` calls `theme-wrap.py` twice per run:
 
-`tw` calls `theme-wrap.py` twice per run:
 - **before** task executes: patches `themes.rc` if the current report has a configured theme
 - **after** task exits: restores `themes.rc` from the saved original (always, even on error)
-
-The keyword just gives the registration a stable name so `tw remove theme-select`
-can find and remove the right entry.
 
 ## Theme search paths
 
@@ -161,7 +203,7 @@ Themes are discovered in this order (first match wins for duplicate names):
 
 ## Project status
 
-Early release (v0.1.0). Core functionality is stable.
+v0.3.0 — theme browser, color editor, and per-report switcher are all stable.
 
 ## Further reading
 
@@ -176,4 +218,4 @@ Early release (v0.1.0). Core functionality is stable.
 - Language: Python 3
 - Requires: Taskwarrior 2.6.0+, Python 3.6+
 - Platforms: Linux
-- Version: 0.1.0
+- Version: 0.3.0
