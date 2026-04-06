@@ -1300,17 +1300,53 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def cmd_list_themes(themes):
+    """Non-TUI mode: print a numbered list of all discovered themes."""
+    for i, path in enumerate(themes, 1):
+        print(f"  {i:3d}.  {path.stem}")
+
+
+def cmd_oneshot(themes, theme_num_1based, task_args):
+    """Non-TUI mode: run task with theme N active, then restore themes.rc."""
+    idx = theme_num_1based - 1
+    if idx < 0 or idx >= len(themes):
+        print(f"theme-select: theme #{theme_num_1based} not found (have {len(themes)} themes)", file=sys.stderr)
+        sys.exit(1)
+
+    theme_path = themes[idx]
+    themes_rc  = THEMES_RC
+
+    try:
+        original = themes_rc.read_text()
+    except FileNotFoundError:
+        original = None
+
+    apply_theme(themes_rc, theme_path, themes)
+
+    import shutil
+    task_bin = shutil.which('task') or 'task'
+    try:
+        result = subprocess.run(['task'] + task_args, executable=task_bin, check=False)
+    finally:
+        if original is not None:
+            themes_rc.write_text(original)
+
+    sys.exit(result.returncode)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
         description=f"theme-select v{VERSION} — preview and select Taskwarrior color themes"
     )
-    parser.add_argument('report', nargs='?', default=None,
-                        help='Report to preview; if given, also sets report.<name>.theme= on apply')
+    parser.add_argument('positional', nargs='*',
+                        help='[report] | [N task-args...]  (omit for TUI)')
     parser.add_argument('--dir', metavar='PATH',
                         help='additional directory to scan for .theme files')
     parser.add_argument('--dev', action='store_true',
                         help='use ~/.taskrc-dev / ~/.task-dev (dev environment)')
+    parser.add_argument('-l', '--list', dest='list_themes', action='store_true',
+                        help='list all discovered themes with numbers and exit')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     args = parser.parse_args()
 
@@ -1318,22 +1354,37 @@ def main():
         os.environ.setdefault('TASKRC',      str(Path.home() / '.taskrc-dev'))
         os.environ.setdefault('TW_TASK_DIR', str(Path.home() / '.task-dev'))
 
-    taskrc = get_taskrc()
-    if not taskrc.exists():
-        print(f"TASKRC not found: {taskrc}", file=sys.stderr)
-        sys.exit(1)
-
     themes = find_themes(args.dir)
     if not themes:
         print("No .theme files found", file=sys.stderr)
         sys.exit(1)
 
-    themes_rc = THEMES_RC
+    # Mode: --list / -l
+    if args.list_themes:
+        cmd_list_themes(themes)
+        return
+
+    positional = args.positional
+
+    # Mode: N [task-args...]  — one-shot theme override
+    if positional and positional[0].isdigit():
+        cmd_oneshot(themes, int(positional[0]), positional[1:])
+        return  # cmd_oneshot calls sys.exit
+
+    # Mode: TUI (normal or configure-report)
+    report = positional[0] if positional else None
+
+    taskrc = get_taskrc()
+    if not taskrc.exists():
+        print(f"TASKRC not found: {taskrc}", file=sys.stderr)
+        sys.exit(1)
+
+    themes_rc    = THEMES_RC
     active_theme = get_active_theme(themes_rc, taskrc)
     ensure_themes_rc(themes_rc, taskrc, themes, active_theme)
 
-    for_report     = args.report                     # None = normal mode
-    preview_report = args.report or 'next'           # always have a report to preview
+    for_report     = report               # None = normal mode
+    preview_report = report or 'next'     # always have a report to preview
 
     if for_report is not None:
         valid = get_valid_reports()

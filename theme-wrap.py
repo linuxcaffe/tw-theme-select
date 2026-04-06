@@ -166,20 +166,50 @@ def patch_themes_rc(theme_path):
     return original
 
 
+def _find_configured_report(report_themes):
+    """Return the report name to theme-switch for, or None.
+
+    Scans TW_TASK_ARGS (JSON list passed by tw) from right to left for the
+    last bare word that matches a configured report.X.theme= key.  This is the
+    user's proposal: 'if the last bare word matches a configured report, apply
+    that theme — otherwise relax.'
+
+    Falls back to TW_REPORT (tw's heuristic) when TW_TASK_ARGS is absent.
+    """
+    import json
+    task_args_raw = os.environ.get('TW_TASK_ARGS', '')
+    if task_args_raw:
+        try:
+            task_args = json.loads(task_args_raw)
+        except Exception:
+            task_args = []
+        for arg in reversed(task_args):
+            if arg.startswith('-') or '=' in arg or ':' in arg:
+                continue
+            if arg in report_themes:
+                return arg
+
+    # Fallback: accept tw's pre-detected report only if it's actually configured
+    tw_report = os.environ.get('TW_REPORT', '')
+    if tw_report in report_themes:
+        return tw_report
+
+    return None
+
+
 def run_pre():
     """Pre-exec phase: patch themes.rc for the requested report."""
-    report  = os.environ.get('TW_REPORT', '')
     session = os.environ.get('TW_PRE_EXEC_SESSION', 'default')
 
+    report_themes = get_report_themes()
+    if not report_themes:
+        sys.exit(0)
+
+    report = _find_configured_report(report_themes)
     if not report:
         sys.exit(0)
 
-    report_themes = get_report_themes()
-    stem = report_themes.get(report)
-    if not stem:
-        sys.exit(0)
-
-    theme_path = find_theme_path(stem)
+    theme_path = find_theme_path(report_themes[report])
     if not theme_path:
         sys.exit(0)
 
