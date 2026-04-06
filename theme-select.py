@@ -975,6 +975,39 @@ def draw(stdscr, themes, cursor, scroll, active_theme, preview_lines, report, me
     stdscr.refresh()
 
 
+# ── Vim-style command prompt ───────────────────────────────────────────────────
+
+def _read_command(stdscr, h, w):
+    """Show a ':' prompt on the status bar, read a command, return it or None.
+
+    Returns the typed string (stripped) on Enter, or None on Esc / empty Enter.
+    Handles backspace; display truncates to fit the bar.
+    """
+    curses.curs_set(1)
+    buf = ''
+    while True:
+        prompt = ':' + buf
+        bar = prompt[:w - 1].ljust(w - 1)
+        try:
+            stdscr.addstr(h - 1, 0, bar, curses.color_pair(CP_STATUS))
+            stdscr.move(h - 1, min(len(prompt), w - 2))
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:           # Esc — cancel
+            curses.curs_set(0)
+            return None
+        elif key in (10, 13):   # Enter — confirm
+            curses.curs_set(0)
+            return buf.strip() or None
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= key < 127:
+            buf += chr(key)
+
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
@@ -1291,6 +1324,17 @@ def run(stdscr, themes, themes_rc, taskrc, report, for_report=None):
             prec_items    = []
             prec_grabbed  = False
             message = "Refreshed"
+
+        elif key == ord(':'):
+            cmd = _read_command(stdscr, h, w)
+            if cmd in ('q', 'Q'):
+                break
+            elif cmd:
+                report        = cmd
+                _preview_cache.clear()
+                last_theme    = None
+                last_prec_ovr = None
+                message       = f"Report: {report}"
 
         elif key == curses.KEY_RESIZE:
             _preview_cache.clear()
